@@ -1,0 +1,5 @@
+{
+  "name": "BatchMind AI",
+  "description": "Collaborative academic intelligence platform for university student batches featuring RAG-powered AI grounded in batch notes.",
+  "requestFramePermissions": []
+}
