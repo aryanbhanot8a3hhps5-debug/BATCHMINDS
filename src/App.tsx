@@ -101,6 +101,13 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<'notes' | 'chat' | 'batch-notes' | 'leaderboard'>('notes');
   const [newNote, setNewNote] = useState({ title: '', content: '', subject: '' });
   const [isAddingNote, setIsAddingNote] = useState(false);
+  const [isCreatingBatch, setIsCreatingBatch] = useState(false);
+  const [isJoiningBatch, setIsJoiningBatch] = useState(false);
+  const [isRequestingNotes, setIsRequestingNotes] = useState(false);
+  const [newBatchData, setNewBatchData] = useState({ name: '', university: '' });
+  const [inviteCodeInput, setInviteCodeInput] = useState('');
+  const [noteRequestData, setNoteRequestData] = useState({ toBatchName: '', message: '' });
+  const [pendingRequests, setPendingRequests] = useState<any[]>([]);
   const [authEmail, setAuthEmail] = useState('');
   const [authPassword, setAuthPassword] = useState('');
   const [isLogin, setIsLogin] = useState(true);
@@ -108,11 +115,20 @@ export default function App() {
   const [leaderboard, setLeaderboard] = useState<Profile[]>([]);
   const [notifications, setNotifications] = useState<Notification[]>([]);
   const [showNotifications, setShowNotifications] = useState(false);
+  const [configError, setConfigError] = useState<string | null>(null);
 
   const chatEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
+    // Check for Supabase configuration
+    const supabaseUrl = (import.meta as any).env.VITE_SUPABASE_URL;
+    const supabaseAnonKey = (import.meta as any).env.VITE_SUPABASE_ANON_KEY;
+    
+    if (!supabaseUrl || !supabaseAnonKey || supabaseUrl === '' || supabaseAnonKey === '') {
+      setConfigError('Supabase configuration is missing. Please set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY in your environment variables.');
+    }
+
     supabase.auth.getSession().then(({ data: { session } }) => {
       setSession(session);
     });
@@ -128,23 +144,18 @@ export default function App() {
     if (session) {
       const ensureProfile = async () => {
         try {
-          const { data: profile, error } = await supabase
-            .from('profiles')
-            .select('*')
-            .eq('id', session.user.id)
-            .single();
+          const displayName = session.user.user_metadata?.display_name || 
+                            session.user.email?.split('@')[0] || 
+                            `Guest_${session.user.id.slice(0, 4)}`;
           
-          if (error && (error.code === 'PGRST116' || error.message.includes('JSON object'))) {
-            const displayName = session.user.user_metadata?.display_name || 
-                              session.user.email?.split('@')[0] || 
-                              `Guest_${session.user.id.slice(0, 4)}`;
-            
-            await supabase.from('profiles').insert([{
+          await fetch('/api/auth/sync-profile', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
               id: session.user.id,
-              display_name: displayName,
-              credibility_score: 0
-            }]);
-          }
+              displayName: displayName
+            })
+          });
         } catch (err) {
           console.error('Profile sync error:', err);
         }
@@ -153,6 +164,7 @@ export default function App() {
       fetchBatches();
       fetchLeaderboard();
       fetchNotifications();
+      fetchPendingRequests();
       
       // Real-time notifications
       const channel = supabase
@@ -227,7 +239,15 @@ export default function App() {
         }
       }
     } catch (error: any) {
-      alert(error.message || 'An error occurred during authentication.');
+      let errorMessage = error.message || 'An error occurred during authentication.';
+      
+      if (errorMessage.toLowerCase().includes('rate limit')) {
+        errorMessage = 'Email rate limit exceeded. Supabase limits how many authentication attempts can be made in a short time for security. Please try again in an hour, or use "Continue as Guest" to explore the app immediately.';
+      } else if (errorMessage.toLowerCase().includes('email') && (errorMessage.toLowerCase().includes('send') || errorMessage.toLowerCase().includes('provider'))) {
+        errorMessage = 'Error sending confirmation email. This usually happens if Supabase email limits are reached or SMTP is not configured. \n\nFIX: Go to your Supabase Dashboard > Authentication > Settings and DISABLE "Confirm Email". This will allow you to sign up without an email link.';
+      }
+      
+      alert(errorMessage);
     } finally {
       setIsLoading(false);
     }
@@ -259,27 +279,122 @@ export default function App() {
   };
 
   const fetchBatches = async () => {
-    const { data, error } = await supabase.from('batches').select('*');
-    if (error) {
-      console.error('Fetch batches error:', error);
-      return;
-    }
-    
-    if (data && data.length > 0) {
-      setBatches(data);
-      if (!selectedBatch) setSelectedBatch(data[0]);
-    } else {
-      // Create a default batch if none exist
-      const { data: newBatch, error: createError } = await supabase
-        .from('batches')
-        .insert([{ name: 'General Batch', university: 'Global' }])
-        .select()
-        .single();
+    if (!session?.user?.id) return;
+    try {
+      const response = await fetch('/api/batches/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: session.user.id })
+      });
+      const data = await response.json();
       
-      if (newBatch) {
-        setBatches([newBatch]);
-        setSelectedBatch(newBatch);
+      if (response.ok && data && data.length > 0) {
+        setBatches(data);
+        if (!selectedBatch) setSelectedBatch(data[0]);
       }
+    } catch (error) {
+      console.error('Fetch batches error:', error);
+    }
+  };
+
+  const handleCreateBatch = async () => {
+    if (!newBatchData.name || !session) return;
+    setIsLoading(true);
+    try {
+      const response = await fetch('/api/batches/create', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...newBatchData,
+          userId: session.user.id
+        })
+      });
+      const data = await response.json();
+      if (response.ok) {
+        setBatches(prev => [...prev, data]);
+        setSelectedBatch(data);
+        setIsCreatingBatch(false);
+        setNewBatchData({ name: '', university: '' });
+      } else {
+        alert(data.error || 'Failed to create batch');
+      }
+    } catch (error) {
+      console.error('Create batch error:', error);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleJoinBatch = async () => {
+    if (!inviteCodeInput || !session) return;
+    setIsLoading(true);
+    try {
+      const response = await fetch('/api/batches/join', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          inviteCode: inviteCodeInput,
+          userId: session.user.id
+        })
+      });
+      const data = await response.json();
+      if (response.ok) {
+        setBatches(prev => {
+          if (prev.find(b => b.id === data.id)) return prev;
+          return [...prev, data];
+        });
+        setSelectedBatch(data);
+        setIsJoiningBatch(false);
+        setInviteCodeInput('');
+      } else {
+        alert(data.error || 'Failed to join batch');
+      }
+    } catch (error) {
+      console.error('Join batch error:', error);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleRequestNotes = async () => {
+    if (!noteRequestData.toBatchName || !selectedBatch || !session) return;
+    setIsLoading(true);
+    try {
+      const response = await fetch('/api/batches/request-notes', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          fromBatchId: selectedBatch.id,
+          toBatchName: noteRequestData.toBatchName,
+          requestedBy: session.user.id,
+          message: noteRequestData.message
+        })
+      });
+      if (response.ok) {
+        alert('Request sent successfully!');
+        setIsRequestingNotes(false);
+        setNoteRequestData({ toBatchName: '', message: '' });
+      } else {
+        const data = await response.json();
+        alert(data.error || 'Failed to send request');
+      }
+    } catch (error) {
+      console.error('Request notes error:', error);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const fetchPendingRequests = async () => {
+    if (!selectedBatch) return;
+    try {
+      const response = await fetch(`/api/batches/requests/${selectedBatch.id}`);
+      const data = await response.json();
+      if (response.ok) {
+        setPendingRequests(data);
+      }
+    } catch (error) {
+      console.error('Fetch requests error:', error);
     }
   };
 
@@ -342,17 +457,37 @@ export default function App() {
     const file = e.target.files?.[0];
     if (!file) return;
 
+    // Check file size (e.g., limit to 1MB)
+    if (file.size > 1024 * 1024) {
+      alert('File is too large. Please upload a file smaller than 1MB.');
+      return;
+    }
+
     const reader = new FileReader();
     reader.onload = (event) => {
-      const content = event.target?.result as string;
-      setNewNote({
-        title: file.name.replace(/\.[^/.]+$/, ""),
-        content: content,
-        subject: 'General'
-      });
-      setIsAddingNote(true);
+      try {
+        const content = event.target?.result as string;
+        if (!content || content.trim() === '') {
+          alert('The file appears to be empty.');
+          return;
+        }
+        setNewNote({
+          title: file.name.replace(/\.[^/.]+$/, ""),
+          content: content,
+          subject: 'General'
+        });
+        setIsAddingNote(true);
+      } catch (err) {
+        alert('Failed to read file content.');
+      }
+    };
+    reader.onerror = () => {
+      alert('Error reading file.');
     };
     reader.readAsText(file);
+    
+    // Reset input so the same file can be uploaded again if needed
+    e.target.value = '';
   };
 
   const handleSendMessage = async () => {
@@ -395,8 +530,20 @@ export default function App() {
   };
 
   const handleCreateNote = async () => {
-    if (!newNote.title || !newNote.content || !selectedBatch || !session) return;
+    if (!newNote.title || !newNote.content) {
+      alert('Please provide both a title and content for your note.');
+      return;
+    }
+    if (!selectedBatch) {
+      alert('Please select a batch first.');
+      return;
+    }
+    if (!session) {
+      alert('You must be signed in to create notes.');
+      return;
+    }
 
+    setIsLoading(true);
     try {
       const response = await fetch('/api/notes/create', {
         method: 'POST',
@@ -411,12 +558,21 @@ export default function App() {
         }),
       });
 
-      if (!response.ok) throw new Error('Failed to create note');
+      const result = await response.json();
+
+      if (!response.ok) {
+        throw new Error(result.error || 'Failed to create note');
+      }
 
       setNewNote({ title: '', content: '', subject: '' });
       setIsAddingNote(false);
+      // Refresh notes
+      fetchNotes(selectedBatch.id);
     } catch (error: any) {
-      alert(error.message);
+      console.error('Create note error:', error);
+      alert(`Error creating note: ${error.message}`);
+    } finally {
+      setIsLoading(false);
     }
   };
 
@@ -428,6 +584,11 @@ export default function App() {
           animate={{ opacity: 1, y: 0 }}
           className="bg-white border-2 border-[#141414] p-8 rounded-3xl shadow-[8px_8px_0px_0px_rgba(20,20,20,1)] w-full max-w-md"
         >
+          {configError && (
+            <div className="mb-6 p-4 bg-red-50 border-2 border-red-500 rounded-xl text-red-600 text-xs font-bold">
+              ⚠️ {configError}
+            </div>
+          )}
           <div className="flex flex-col items-center mb-8">
             <div className="w-16 h-16 bg-[#141414] rounded-2xl flex items-center justify-center mb-4 shadow-lg">
               <BookOpen className="w-8 h-8 text-[#E4E3E0]" />
@@ -470,11 +631,21 @@ export default function App() {
           </form>
 
           <div className="mt-6 flex flex-col gap-3">
-            {!isLogin && (
-              <p className="text-[10px] font-bold text-[#141414]/40 uppercase tracking-widest text-center mb-2">
-                Note: Email confirmation may be required to sign in.
+            {configError && (
+              <p className="text-[10px] font-bold text-red-500 uppercase tracking-widest text-center mb-2">
+                Note: Supabase configuration is missing or incorrect.
               </p>
             )}
+            <div className="text-center space-y-1 mb-2">
+              {!isLogin && (
+                <p className="text-[10px] font-bold text-[#141414]/60 uppercase tracking-widest">
+                  Note: Email confirmation may be required.
+                </p>
+              )}
+              <p className="text-[10px] font-bold text-[#141414]/40 uppercase tracking-widest">
+                Tip: If email fails, disable "Confirm Email" in Supabase Auth Settings.
+              </p>
+            </div>
             <button 
               onClick={handleGuestLogin}
               className="w-full border-2 border-[#141414] text-[#141414] py-3 rounded-xl font-bold uppercase tracking-widest hover:bg-[#141414]/5 transition-all"
@@ -544,9 +715,27 @@ export default function App() {
           </button>
 
           <div className="pt-6">
-            <label className="text-[10px] uppercase tracking-widest text-[#E4E3E0]/40 font-black mb-3 block px-3">
-              Your Batches
-            </label>
+            <div className="flex items-center justify-between mb-3 px-3">
+              <label className="text-[10px] uppercase tracking-widest text-[#E4E3E0]/40 font-black">
+                Your Batches
+              </label>
+              <div className="flex gap-2">
+                <button 
+                  onClick={() => setIsCreatingBatch(true)}
+                  className="p-2 hover:bg-[#E4E3E0]/10 rounded-xl text-[#E4E3E0]/60 hover:text-white transition-all border border-[#E4E3E0]/10"
+                  title="Create Batch"
+                >
+                  <Plus className="w-4 h-4" />
+                </button>
+                <button 
+                  onClick={() => setIsJoiningBatch(true)}
+                  className="p-2 hover:bg-[#E4E3E0]/10 rounded-xl text-[#E4E3E0]/60 hover:text-white transition-all border border-[#E4E3E0]/10"
+                  title="Join Batch"
+                >
+                  <Layers className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
             <div className="space-y-1">
               {batches.map(batch => (
                 <button
@@ -600,9 +789,12 @@ export default function App() {
               <Users className="w-5 h-5" />
             </button>
             <div className="h-4 w-px bg-[#141414]/10" />
-            <h2 className="font-serif italic text-lg">
-              {selectedBatch ? `${selectedBatch.name} Dashboard` : 'Select a Batch'}
-            </h2>
+            <button 
+              onClick={() => setIsSidebarOpen(true)}
+              className="font-serif italic text-lg hover:text-[#141414]/60 transition-colors text-left"
+            >
+              {selectedBatch ? `${selectedBatch.name} Dashboard` : 'Select a Batch (Click to Open Sidebar)'}
+            </button>
           </div>
 
           <div className="flex items-center gap-4">
@@ -678,7 +870,33 @@ export default function App() {
                 exit={{ opacity: 0, y: -10 }}
                 className="flex-1 flex flex-col p-6 overflow-y-auto"
               >
-                <div className="flex items-center justify-between mb-8">
+                {!selectedBatch ? (
+                  <div className="h-full flex flex-col items-center justify-center text-center p-12">
+                    <div className="w-24 h-24 bg-[#141414] rounded-[2.5rem] flex items-center justify-center mb-8 shadow-2xl rotate-6">
+                      <Users className="w-12 h-12 text-[#E4E3E0]" />
+                    </div>
+                    <h3 className="text-4xl font-serif italic mb-4">No Batch Selected</h3>
+                    <p className="text-lg font-bold text-[#141414]/60 max-w-md uppercase tracking-tight mb-8">
+                      Select a batch from the sidebar or launch a new community to start collaborating.
+                    </p>
+                    <div className="flex gap-4">
+                      <button 
+                        onClick={() => setIsCreatingBatch(true)}
+                        className="bg-[#141414] text-[#E4E3E0] px-8 py-4 rounded-2xl font-black uppercase tracking-widest hover:translate-y-[-4px] hover:shadow-[8px_8px_0px_0px_rgba(0,0,0,0.2)] transition-all"
+                      >
+                        Launch New Batch
+                      </button>
+                      <button 
+                        onClick={() => setIsJoiningBatch(true)}
+                        className="bg-white border-4 border-[#141414] text-[#141414] px-8 py-4 rounded-2xl font-black uppercase tracking-widest hover:translate-y-[-4px] hover:shadow-[8px_8px_0px_0px_rgba(0,0,0,0.2)] transition-all"
+                      >
+                        Join Existing
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    <div className="flex items-center justify-between mb-8">
                   <div>
                     <h3 className="text-2xl font-bold tracking-tight mb-1">Batch Repository</h3>
                     <p className="text-sm text-[#141414]/60">All academic notes for this batch.</p>
@@ -689,7 +907,7 @@ export default function App() {
                       ref={fileInputRef}
                       onChange={handleFileUpload}
                       className="hidden"
-                      accept=".txt,.md"
+                      accept=".txt,.md,.js,.ts,.py,.cpp,.java,.c,.h,.css,.html,.json"
                     />
                     <button 
                       onClick={() => fileInputRef.current?.click()}
@@ -745,15 +963,57 @@ export default function App() {
                       </button>
                       <button 
                         onClick={handleCreateNote}
-                        className="bg-[#141414] text-[#E4E3E0] px-8 py-3 rounded-xl font-black uppercase tracking-widest text-xs hover:translate-y-[-2px] transition-all"
+                        disabled={isLoading}
+                        className="bg-[#141414] text-[#E4E3E0] px-8 py-3 rounded-xl font-black uppercase tracking-widest text-xs hover:translate-y-[-2px] transition-all disabled:opacity-50 disabled:translate-y-0"
                       >
-                        Publish Note
+                        {isLoading ? (
+                          <div className="flex items-center gap-2">
+                            <Loader2 className="w-3 h-3 animate-spin" />
+                            Publishing...
+                          </div>
+                        ) : 'Publish Note'}
                       </button>
                     </div>
                   </motion.div>
                 )}
 
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                  {/* Batch Info Card */}
+                  {selectedBatch && (
+                    <div className="col-span-full bg-[#141414] text-[#E4E3E0] p-6 rounded-2xl flex flex-col md:flex-row items-center justify-between gap-6 mb-2">
+                      <div>
+                        <h3 className="text-2xl font-serif italic mb-1">{selectedBatch.name}</h3>
+                        <p className="text-xs font-bold uppercase tracking-widest opacity-60">{selectedBatch.university}</p>
+                        <div className="mt-4 flex items-center gap-4">
+                          <div className="bg-white/10 px-3 py-1 rounded-lg">
+                            <p className="text-[10px] uppercase tracking-tighter opacity-60">Invite Code</p>
+                            <p className="font-mono font-black text-lg tracking-widest">{selectedBatch.invite_code}</p>
+                          </div>
+                          <button 
+                            onClick={() => setIsRequestingNotes(true)}
+                            className="bg-emerald-500 text-[#141414] px-4 py-2 rounded-xl font-black uppercase tracking-widest text-[10px] hover:translate-y-[-2px] transition-all"
+                          >
+                            Request Notes from Another Batch
+                          </button>
+                        </div>
+                      </div>
+                      
+                      {pendingRequests.length > 0 && (
+                        <div className="flex-1 max-w-md w-full">
+                          <h4 className="text-[10px] uppercase tracking-widest font-black mb-3 opacity-60">Incoming Note Requests</h4>
+                          <div className="space-y-2">
+                            {pendingRequests.map(req => (
+                              <div key={req.id} className="bg-white/5 p-3 rounded-xl border border-white/10 text-xs">
+                                <p className="font-bold mb-1">From: {req.from_batch?.name}</p>
+                                <p className="opacity-60 italic">"{req.message}"</p>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
                   {notes.map(note => (
                     <div 
                       key={note.id}
@@ -800,7 +1060,9 @@ export default function App() {
                     </div>
                   ))}
                 </div>
-              </motion.div>
+              </>
+            )}
+          </motion.div>
             ) : activeTab === 'batch-notes' ? (
               <motion.div 
                 key="batch-notes"
@@ -965,6 +1227,140 @@ export default function App() {
           </AnimatePresence>
         </div>
       </main>
+
+      {/* Modals */}
+      <AnimatePresence>
+        {isCreatingBatch && (
+          <div className="fixed inset-0 bg-[#141414]/80 backdrop-blur-sm z-[100] flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ scale: 0.9, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.9, opacity: 0 }}
+              className="bg-[#E4E3E0] border-4 border-[#141414] w-full max-w-md rounded-3xl p-8 shadow-[16px_16px_0px_0px_rgba(20,20,20,1)]"
+            >
+              <div className="flex items-center justify-between mb-8">
+                <h2 className="text-3xl font-serif italic">Create New Batch</h2>
+                <button onClick={() => setIsCreatingBatch(false)} className="p-2 hover:bg-[#141414]/5 rounded-full transition-all">
+                  <X className="w-6 h-6" />
+                </button>
+              </div>
+              <div className="space-y-6">
+                <div>
+                  <label className="text-[10px] uppercase tracking-widest font-black mb-2 block">Batch Name</label>
+                  <input 
+                    type="text" 
+                    placeholder="e.g., CS 101 - Fall 2024"
+                    value={newBatchData.name}
+                    onChange={e => setNewBatchData({ ...newBatchData, name: e.target.value })}
+                    className="w-full bg-white border-2 border-[#141414] rounded-xl px-4 py-3 outline-none focus:shadow-[4px_4px_0px_0px_rgba(20,20,20,1)] transition-all font-bold"
+                  />
+                </div>
+                <div>
+                  <label className="text-[10px] uppercase tracking-widest font-black mb-2 block">University / Institution</label>
+                  <input 
+                    type="text" 
+                    placeholder="e.g., Stanford University"
+                    value={newBatchData.university}
+                    onChange={e => setNewBatchData({ ...newBatchData, university: e.target.value })}
+                    className="w-full bg-white border-2 border-[#141414] rounded-xl px-4 py-3 outline-none focus:shadow-[4px_4px_0px_0px_rgba(20,20,20,1)] transition-all font-bold"
+                  />
+                </div>
+                <button 
+                  onClick={handleCreateBatch}
+                  disabled={isLoading || !newBatchData.name}
+                  className="w-full bg-[#141414] text-[#E4E3E0] py-4 rounded-xl font-black uppercase tracking-widest hover:translate-y-[-2px] transition-all disabled:opacity-50"
+                >
+                  {isLoading ? 'Creating...' : 'Launch Batch'}
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+
+        {isJoiningBatch && (
+          <div className="fixed inset-0 bg-[#141414]/80 backdrop-blur-sm z-[100] flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ scale: 0.9, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.9, opacity: 0 }}
+              className="bg-[#E4E3E0] border-4 border-[#141414] w-full max-w-md rounded-3xl p-8 shadow-[16px_16px_0px_0px_rgba(20,20,20,1)]"
+            >
+              <div className="flex items-center justify-between mb-8">
+                <h2 className="text-3xl font-serif italic">Join a Batch</h2>
+                <button onClick={() => setIsJoiningBatch(false)} className="p-2 hover:bg-[#141414]/5 rounded-full transition-all">
+                  <X className="w-6 h-6" />
+                </button>
+              </div>
+              <div className="space-y-6">
+                <div>
+                  <label className="text-[10px] uppercase tracking-widest font-black mb-2 block">Invite Code</label>
+                  <input 
+                    type="text" 
+                    placeholder="ENTER 6-DIGIT CODE"
+                    value={inviteCodeInput}
+                    onChange={e => setInviteCodeInput(e.target.value.toUpperCase())}
+                    className="w-full bg-white border-2 border-[#141414] rounded-xl px-4 py-3 outline-none focus:shadow-[4px_4px_0px_0px_rgba(20,20,20,1)] transition-all font-bold text-center text-2xl tracking-[0.5em]"
+                    maxLength={6}
+                  />
+                </div>
+                <button 
+                  onClick={handleJoinBatch}
+                  disabled={isLoading || inviteCodeInput.length < 6}
+                  className="w-full bg-[#141414] text-[#E4E3E0] py-4 rounded-xl font-black uppercase tracking-widest hover:translate-y-[-2px] transition-all disabled:opacity-50"
+                >
+                  {isLoading ? 'Joining...' : 'Enter Batch'}
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+
+        {isRequestingNotes && (
+          <div className="fixed inset-0 bg-[#141414]/80 backdrop-blur-sm z-[100] flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ scale: 0.9, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.9, opacity: 0 }}
+              className="bg-[#E4E3E0] border-4 border-[#141414] w-full max-w-md rounded-3xl p-8 shadow-[16px_16px_0px_0px_rgba(20,20,20,1)]"
+            >
+              <div className="flex items-center justify-between mb-8">
+                <h2 className="text-3xl font-serif italic">Request Notes</h2>
+                <button onClick={() => setIsRequestingNotes(false)} className="p-2 hover:bg-[#141414]/5 rounded-full transition-all">
+                  <X className="w-6 h-6" />
+                </button>
+              </div>
+              <div className="space-y-6">
+                <div>
+                  <label className="text-[10px] uppercase tracking-widest font-black mb-2 block">Target Batch Name</label>
+                  <input 
+                    type="text" 
+                    placeholder="Exact name of the other batch"
+                    value={noteRequestData.toBatchName}
+                    onChange={e => setNoteRequestData({ ...noteRequestData, toBatchName: e.target.value })}
+                    className="w-full bg-white border-2 border-[#141414] rounded-xl px-4 py-3 outline-none focus:shadow-[4px_4px_0px_0px_rgba(20,20,20,1)] transition-all font-bold"
+                  />
+                </div>
+                <div>
+                  <label className="text-[10px] uppercase tracking-widest font-black mb-2 block">Message / Topic</label>
+                  <textarea 
+                    placeholder="What notes do you need? (e.g., Week 5 Calculus)"
+                    value={noteRequestData.message}
+                    onChange={e => setNoteRequestData({ ...noteRequestData, message: e.target.value })}
+                    className="w-full bg-white border-2 border-[#141414] rounded-xl px-4 py-3 outline-none focus:shadow-[4px_4px_0px_0px_rgba(20,20,20,1)] transition-all font-bold h-24 resize-none"
+                  />
+                </div>
+                <button 
+                  onClick={handleRequestNotes}
+                  disabled={isLoading || !noteRequestData.toBatchName}
+                  className="w-full bg-[#141414] text-[#E4E3E0] py-4 rounded-xl font-black uppercase tracking-widest hover:translate-y-[-2px] transition-all disabled:opacity-50"
+                >
+                  {isLoading ? 'Sending...' : 'Send Request'}
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }

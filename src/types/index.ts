@@ -2,6 +2,7 @@ export interface Batch {
   id: string;
   name: string;
   university: string;
+  invite_code: string;
   created_at: string;
 }
 

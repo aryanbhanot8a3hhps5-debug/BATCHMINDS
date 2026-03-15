@@ -22,6 +22,11 @@ async function startServer() {
   // Supabase Setup
   const supabaseUrl = process.env.SUPABASE_URL || "";
   const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+  
+  if (!supabaseUrl || !supabaseServiceKey) {
+    console.warn("⚠️ SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is missing. Backend features will fail.");
+  }
+
   const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
   // Gemini Setup
@@ -30,6 +35,246 @@ async function startServer() {
   // API Routes
   app.get("/api/health", (req, res) => {
     res.json({ status: "ok", message: "BatchMind AI Backend Active" });
+  });
+
+  app.post("/api/auth/sync-profile", async (req, res) => {
+    const { id, displayName } = req.body;
+    try {
+      const { data: profile, error: fetchError } = await supabase
+        .from('profiles')
+        .select('*')
+        .eq('id', id)
+        .single();
+      
+      if (fetchError && (fetchError.code === 'PGRST116')) {
+        const { error: insertError } = await supabase.from('profiles').insert([{
+          id,
+          display_name: displayName,
+          credibility_score: 0
+        }]);
+        if (insertError) throw insertError;
+      }
+      res.json({ success: true });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.post("/api/batches/sync", async (req, res) => {
+    const { userId } = req.body;
+    try {
+      // 1. Get batches where user is a member
+      const { data: memberships, error: memberError } = await supabase
+        .from('batch_members')
+        .select('batch_id')
+        .eq('user_id', userId);
+      
+      if (memberError) throw memberError;
+
+      if (memberships && memberships.length > 0) {
+        const batchIds = memberships.map(m => m.batch_id);
+        const { data: batches, error: fetchError } = await supabase
+          .from('batches')
+          .select('*')
+          .in('id', batchIds);
+        
+        if (fetchError) throw fetchError;
+        return res.json(batches);
+      }
+
+      // 2. If no memberships, check if any public batches exist or create a default one
+      const { data: batches, error: fetchError } = await supabase
+        .from('batches')
+        .select('*')
+        .eq('name', 'General Batch')
+        .limit(1);
+      
+      if (fetchError) throw fetchError;
+
+      let targetBatch;
+      if (batches && batches.length > 0) {
+        targetBatch = batches[0];
+      } else {
+        // Create default batch if none exist
+        const { data: newBatch, error: insertError } = await supabase
+          .from('batches')
+          .insert([{ 
+            name: 'General Batch', 
+            university: 'Global',
+            invite_code: Math.random().toString(36).substring(2, 8).toUpperCase()
+          }])
+          .select()
+          .single();
+        
+        if (insertError) throw insertError;
+        targetBatch = newBatch;
+      }
+
+      // Add user to the batch
+      await supabase.from('batch_members').insert([{
+        batch_id: targetBatch.id,
+        user_id: userId,
+        role: 'member'
+      }]);
+
+      res.json([targetBatch]);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.post("/api/batches/create", async (req, res) => {
+    const { name, university, userId } = req.body;
+    const inviteCode = Math.random().toString(36).substring(2, 8).toUpperCase();
+
+    try {
+      console.log(`[Create Batch] Name: ${name}, User: ${userId}`);
+      
+      // 1. Create the batch
+      const { data: batch, error: batchError } = await supabase
+        .from('batches')
+        .insert([{ 
+          name, 
+          university: university || 'Global', 
+          invite_code: inviteCode, 
+          created_by: userId 
+        }])
+        .select()
+        .single();
+      
+      if (batchError) {
+        console.error("Batch Creation Error:", batchError);
+        // Fallback: try without created_by if column might be missing
+        if (batchError.message.includes('created_by')) {
+          const { data: fallbackBatch, error: fallbackError } = await supabase
+            .from('batches')
+            .insert([{ name, university: university || 'Global', invite_code: inviteCode }])
+            .select()
+            .single();
+          
+          if (fallbackError) throw fallbackError;
+          
+          // Add membership
+          await supabase.from('batch_members').insert([{ batch_id: fallbackBatch.id, user_id: userId, role: 'admin' }]);
+          return res.json(fallbackBatch);
+        }
+        throw batchError;
+      }
+
+      // 2. Add creator as admin
+      const { error: memberError } = await supabase
+        .from('batch_members')
+        .insert([{ batch_id: batch.id, user_id: userId, role: 'admin' }]);
+      
+      if (memberError) {
+        console.error("Member Addition Error:", memberError);
+        // Even if membership fails, we created the batch, but user won't see it.
+        // We'll return the batch anyway and hope sync picks it up or user joins.
+      }
+
+      res.json(batch);
+    } catch (error: any) {
+      console.error("Final Create Batch Error:", error);
+      res.status(500).json({ error: error.message || "Failed to create batch" });
+    }
+  });
+
+  app.post("/api/batches/join", async (req, res) => {
+    const { inviteCode, userId } = req.body;
+
+    try {
+      const { data: batch, error: batchError } = await supabase
+        .from('batches')
+        .select('*')
+        .eq('invite_code', inviteCode.toUpperCase())
+        .single();
+      
+      if (batchError || !batch) {
+        return res.status(404).json({ error: "Invalid invite code" });
+      }
+
+      // Check if already a member
+      const { data: existing } = await supabase
+        .from('batch_members')
+        .select('*')
+        .eq('batch_id', batch.id)
+        .eq('user_id', userId)
+        .single();
+      
+      if (existing) {
+        return res.json(batch);
+      }
+
+      const { error: memberError } = await supabase
+        .from('batch_members')
+        .insert([{ batch_id: batch.id, user_id: userId, role: 'member' }]);
+      
+      if (memberError) throw memberError;
+
+      res.json(batch);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.post("/api/batches/request-notes", async (req, res) => {
+    const { fromBatchId, toBatchName, requestedBy, message } = req.body;
+
+    try {
+      // Find target batch by name
+      const { data: targetBatch, error: batchError } = await supabase
+        .from('batches')
+        .select('id')
+        .eq('name', toBatchName)
+        .single();
+      
+      if (batchError || !targetBatch) {
+        return res.status(404).json({ error: "Target batch not found" });
+      }
+
+      const { data: request, error: requestError } = await supabase
+        .from('batch_requests')
+        .insert([{
+          from_batch_id: fromBatchId,
+          to_batch_id: targetBatch.id,
+          requested_by: requestedBy,
+          message,
+          status: 'pending'
+        }])
+        .select()
+        .single();
+      
+      if (requestError) throw requestError;
+
+      // Notify target batch members (simplified: notify creator)
+      const { data: targetBatchInfo } = await supabase.from('batches').select('created_by').eq('id', targetBatch.id).single();
+      if (targetBatchInfo?.created_by) {
+        await supabase.from('notifications').insert([{
+          user_id: targetBatchInfo.created_by,
+          message: `New note request from another batch: ${message}`
+        }]);
+      }
+
+      res.json(request);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.get("/api/batches/requests/:batchId", async (req, res) => {
+    const { batchId } = req.params;
+    try {
+      const { data, error } = await supabase
+        .from('batch_requests')
+        .select('*, from_batch:batches!from_batch_id(name)')
+        .eq('to_batch_id', batchId)
+        .eq('status', 'pending');
+      
+      if (error) throw error;
+      res.json(data);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
   });
 
   // RAG Endpoint: Generate Embeddings & Query
@@ -200,13 +445,21 @@ async function startServer() {
       if (insertError) throw insertError;
 
       // 2. Generate embedding (async)
-      genAI.models.embedContent({
-        model: "gemini-embedding-2-preview",
-        contents: [content]
-      }).then(async (embeddingResponse) => {
-        const embedding = embeddingResponse.embeddings[0].values;
-        await supabase.from("notes").update({ embedding }).eq("id", note.id);
-      });
+      try {
+        const embeddingResponse = await genAI.models.embedContent({
+          model: "gemini-embedding-2-preview",
+          contents: [content]
+        });
+        
+        if (embeddingResponse.embeddings && embeddingResponse.embeddings.length > 0) {
+          const embedding = embeddingResponse.embeddings[0].values;
+          await supabase.from("notes").update({ embedding }).eq("id", note.id);
+        }
+      } catch (embedError) {
+        console.error("Embedding generation failed for note:", note.id, embedError);
+        // We don't fail the whole request if embedding fails, 
+        // but the note won't be searchable via AI until re-indexed
+      }
 
       // 3. Create notifications for other users in the batch
       // For simplicity in hackathon, we'll notify all users except the author
